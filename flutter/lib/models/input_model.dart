@@ -18,7 +18,7 @@ import '../common.dart';
 import '../consts.dart';
 
 /// Mouse button enum.
-enum MouseButtons { left, right, wheel }
+enum MouseButtons { left, right, wheel, back }
 
 const _kMouseEventDown = 'mousedown';
 const _kMouseEventUp = 'mouseup';
@@ -155,6 +155,8 @@ extension ToString on MouseButtons {
         return 'right';
       case MouseButtons.wheel:
         return 'wheel';
+      case MouseButtons.back:
+        return 'back';
     }
   }
 }
@@ -343,8 +345,11 @@ class InputModel {
   var _fling = false;
   Timer? _flingTimer;
   final _flingBaseDelay = 30;
-  // trackpad, peer linux
-  final _trackpadSpeed = 0.06;
+  final _trackpadAdjustPeerLinux = 0.06;
+  // This is an experience value.
+  final _trackpadAdjustMacToWin = 2.50;
+  int _trackpadSpeed = kDefaultTrackpadSpeed;
+  double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
   var _trackpadScrollUnsent = Offset.zero;
 
   var _lastScale = 1.0;
@@ -366,7 +371,10 @@ class InputModel {
   String get id => parent.target?.id ?? '';
   String? get peerPlatform => parent.target?.ffiModel.pi.platform;
   bool get isViewOnly => parent.target!.ffiModel.viewOnly;
+  bool get showMyCursor => parent.target!.ffiModel.showMyCursor;
   double get devicePixelRatio => parent.target!.canvasModel.devicePixelRatio;
+  bool get isViewCamera => parent.target!.connType == ConnType.viewCamera;
+  int get trackpadSpeed => _trackpadSpeed;
 
   InputModel(this.parent) {
     sessionId = parent.target!.sessionId;
@@ -380,6 +388,28 @@ class InputModel {
       keyboardMode = await bind.sessionGetKeyboardMode(sessionId: sessionId) ??
           kKeyLegacyMode;
     }
+  }
+
+  /// Updates the trackpad speed based on the session value.
+  ///
+  /// The expected format of the retrieved value is a string that can be parsed into a double.
+  /// If parsing fails or the value is out of bounds (less than `kMinTrackpadSpeed` or greater
+  /// than `kMaxTrackpadSpeed`), the trackpad speed is reset to the default
+  /// value (`kDefaultTrackpadSpeed`).
+  ///
+  /// Bounds:
+  /// - Minimum: `kMinTrackpadSpeed`
+  /// - Maximum: `kMaxTrackpadSpeed`
+  /// - Default: `kDefaultTrackpadSpeed`
+  Future<void> updateTrackpadSpeed() async {
+    _trackpadSpeed =
+        (await bind.sessionGetTrackpadSpeed(sessionId: sessionId) ??
+            kDefaultTrackpadSpeed);
+    if (_trackpadSpeed < kMinTrackpadSpeed ||
+        _trackpadSpeed > kMaxTrackpadSpeed) {
+      _trackpadSpeed = kDefaultTrackpadSpeed;
+    }
+    _trackpadSpeedInner = _trackpadSpeed / 100.0;
   }
 
   void handleKeyDownEventModifiers(KeyEvent e) {
@@ -469,6 +499,7 @@ class InputModel {
 
   KeyEventResult handleRawKeyEvent(RawKeyEvent e) {
     if (isViewOnly) return KeyEventResult.handled;
+    if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -523,6 +554,7 @@ class InputModel {
 
   KeyEventResult handleKeyEvent(KeyEvent e) {
     if (isViewOnly) return KeyEventResult.handled;
+    if (isViewCamera) return KeyEventResult.handled;
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
@@ -722,6 +754,7 @@ class InputModel {
   /// [press] indicates a click event(down and up).
   void inputKey(String name, {bool? down, bool? press}) {
     if (!keyboardPerm) return;
+    if (isViewCamera) return;
     bind.sessionInputKey(
         sessionId: sessionId,
         name: name,
@@ -783,6 +816,7 @@ class InputModel {
 
   /// Send scroll event with scroll distance [y].
   Future<void> scroll(int y) async {
+    if (isViewCamera) return;
     await bind.sessionSendMouse(
         sessionId: sessionId,
         msg: json
@@ -806,6 +840,7 @@ class InputModel {
   /// Send mouse press event.
   Future<void> sendMouse(String type, MouseButtons button) async {
     if (!keyboardPerm) return;
+    if (isViewCamera) return;
     await bind.sessionSendMouse(
         sessionId: sessionId,
         msg: json.encode(modify({'type': type, 'buttons': button.value})));
@@ -832,6 +867,7 @@ class InputModel {
   /// Send mouse movement event with distance in [x] and [y].
   Future<void> moveMouse(double x, double y) async {
     if (!keyboardPerm) return;
+    if (isViewCamera) return;
     var x2 = x.toInt();
     var y2 = y.toInt();
     await bind.sessionSendMouse(
@@ -841,7 +877,7 @@ class InputModel {
 
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (!isPhysicalMouse.value) {
       isPhysicalMouse.value = true;
@@ -855,6 +891,7 @@ class InputModel {
     _lastScale = 1.0;
     _stopFling = true;
     if (isViewOnly) return;
+    if (isViewCamera) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanStart, e.position);
     }
@@ -863,6 +900,7 @@ class InputModel {
   // https://docs.flutter.dev/release/breaking-changes/trackpad-gestures
   void onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
     if (isViewOnly) return;
+    if (isViewCamera) return;
     if (peerPlatform != kPeerPlatformAndroid) {
       final scale = ((e.scale - _lastScale) * 1000).toInt();
       _lastScale = e.scale;
@@ -877,13 +915,16 @@ class InputModel {
       }
     }
 
-    final delta = e.panDelta;
+    var delta = e.panDelta * _trackpadSpeedInner;
+    if (isMacOS && peerPlatform == kPeerPlatformWindows) {
+      delta *= _trackpadAdjustMacToWin;
+    }
     _trackpadLastDelta = delta;
 
     var x = delta.dx.toInt();
     var y = delta.dy.toInt();
     if (peerPlatform == kPeerPlatformLinux) {
-      _trackpadScrollUnsent += (delta * _trackpadSpeed);
+      _trackpadScrollUnsent += (delta * _trackpadAdjustPeerLinux);
       x = _trackpadScrollUnsent.dx.truncate();
       y = _trackpadScrollUnsent.dy.truncate();
       _trackpadScrollUnsent -= Offset(x.toDouble(), y.toDouble());
@@ -902,6 +943,7 @@ class InputModel {
         handlePointerEvent('touch', kMouseEventTypePanUpdate,
             Offset(x.toDouble(), y.toDouble()));
       } else {
+        if (isViewCamera) return;
         bind.sessionSendMouse(
             sessionId: sessionId,
             msg: '{"type": "trackpad", "x": "$x", "y": "$y"}');
@@ -910,6 +952,7 @@ class InputModel {
   }
 
   void _scheduleFling(double x, double y, int delay) {
+    if (isViewCamera) return;
     if ((x == 0 && y == 0) || _stopFling) {
       _fling = false;
       return;
@@ -929,8 +972,8 @@ class InputModel {
       var dx = x.toInt();
       var dy = y.toInt();
       if (parent.target?.ffiModel.pi.platform == kPeerPlatformLinux) {
-        dx = (x * _trackpadSpeed).toInt();
-        dy = (y * _trackpadSpeed).toInt();
+        dx = (x * _trackpadAdjustPeerLinux).toInt();
+        dy = (y * _trackpadAdjustPeerLinux).toInt();
       }
 
       var delay = _flingBaseDelay;
@@ -961,6 +1004,7 @@ class InputModel {
   }
 
   void onPointerPanZoomEnd(PointerPanZoomEndEvent e) {
+    if (isViewCamera) return;
     if (peerPlatform == kPeerPlatformAndroid) {
       handlePointerEvent('touch', kMouseEventTypePanEnd, e.position);
       return;
@@ -975,7 +1019,10 @@ class InputModel {
     _stopFling = false;
 
     // 2.0 is an experience value
-    double minFlingValue = 2.0;
+    double minFlingValue = 2.0 * _trackpadSpeedInner;
+    if (isMacOS && peerPlatform == kPeerPlatformWindows) {
+      minFlingValue *= _trackpadAdjustMacToWin;
+    }
     if (_trackpadLastDelta.dx.abs() > minFlingValue ||
         _trackpadLastDelta.dy.abs() > minFlingValue) {
       _fling = true;
@@ -991,7 +1038,8 @@ class InputModel {
     if (isDesktop) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
     _windowRect = null;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
+    if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) {
       if (isPhysicalMouse.value) {
         isPhysicalMouse.value = false;
@@ -1004,7 +1052,8 @@ class InputModel {
 
   void onPointUpImage(PointerUpEvent e) {
     if (isDesktop) _queryOtherWindowCoords = false;
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
+    if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (isPhysicalMouse.value) {
       handleMouse(_getMouseEvent(e, _kMouseEventUp), e.position);
@@ -1012,7 +1061,8 @@ class InputModel {
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
-    if (isViewOnly) return;
+    if (isViewOnly && !showMyCursor) return;
+    if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
     if (_queryOtherWindowCoords) {
       Future.delayed(Duration.zero, () async {
@@ -1047,6 +1097,7 @@ class InputModel {
 
   void onPointerSignalImage(PointerSignalEvent e) {
     if (isViewOnly) return;
+    if (isViewCamera) return;
     if (e is PointerScrollEvent) {
       var dx = e.scrollDelta.dx.toInt();
       var dy = e.scrollDelta.dy.toInt();
@@ -1144,6 +1195,7 @@ class InputModel {
     }
 
     final evt = PointerEventToRust(kind, type, evtValue).toJson();
+    if (isViewCamera) return;
     bind.sessionSendPointer(
         sessionId: sessionId, msg: json.encode(modify(evt)));
   }
@@ -1175,6 +1227,7 @@ class InputModel {
     Offset offset, {
     bool onExit = false,
   }) {
+    if (isViewCamera) return;
     double x = offset.dx;
     double y = max(0.0, offset.dy);
     if (_checkPeerControlProtected(x, y)) {
@@ -1260,8 +1313,12 @@ class InputModel {
           isMove = false;
           canvas = coords.canvas;
           rect = coords.remoteRect;
-          x -= coords.relativeOffset.dx / devicePixelRatio;
-          y -= coords.relativeOffset.dy / devicePixelRatio;
+          x -= isWindows
+              ? coords.relativeOffset.dx / devicePixelRatio
+              : coords.relativeOffset.dx;
+          y -= isWindows
+              ? coords.relativeOffset.dy / devicePixelRatio
+              : coords.relativeOffset.dy;
         }
       }
     }
@@ -1286,15 +1343,21 @@ class InputModel {
   }
 
   bool _isInCurrentWindow(double x, double y) {
-    final w = _windowRect!.width / devicePixelRatio;
-    final h = _windowRect!.width / devicePixelRatio;
+    var w = _windowRect!.width;
+    var h = _windowRect!.height;
+    if (isWindows) {
+      w /= devicePixelRatio;
+      h /= devicePixelRatio;
+    }
     return x >= 0 && y >= 0 && x <= w && y <= h;
   }
 
   static RemoteWindowCoords? findRemoteCoords(double x, double y,
       List<RemoteWindowCoords> remoteWindowCoords, double devicePixelRatio) {
-    x *= devicePixelRatio;
-    y *= devicePixelRatio;
+    if (isWindows) {
+      x *= devicePixelRatio;
+      y *= devicePixelRatio;
+    }
     for (final c in remoteWindowCoords) {
       if (x >= c.relativeOffset.dx &&
           y >= c.relativeOffset.dy &&
@@ -1426,7 +1489,18 @@ class InputModel {
     }
   }
 
-  void onMobileBack() => tap(MouseButtons.right);
+  void onMobileBack() {
+    final minBackButtonVersion = "1.3.8";
+    final peerVersion =
+        parent.target?.ffiModel.pi.version ?? minBackButtonVersion;
+    var btn = MouseButtons.back;
+    // For compatibility with old versions
+    if (versionCmp(peerVersion, minBackButtonVersion) < 0) {
+      btn = MouseButtons.right;
+    }
+    tap(btn);
+  }
+
   void onMobileHome() => tap(MouseButtons.wheel);
   Future<void> onMobileApps() async {
     sendMouse('down', MouseButtons.wheel);

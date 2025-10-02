@@ -239,6 +239,7 @@ struct wf_clipboard
 	size_t nFiles;
 	size_t file_array_size;
 	WCHAR **file_names;
+	size_t first_file_index;
 	FILEDESCRIPTORW **fileDescriptor;
 
 	BOOL legacyApi;
@@ -269,6 +270,7 @@ static UINT cliprdr_send_request_filecontents(wfClipboard *clipboard, UINT32 con
 											  DWORD positionlow, ULONG request);
 
 static BOOL is_file_descriptor_from_remote();
+static BOOL is_set_by_instance(wfClipboard *clipboard);
 
 static void CliprdrDataObject_Delete(CliprdrDataObject *instance);
 
@@ -600,8 +602,11 @@ static CliprdrStream *CliprdrStream_New(UINT32 connID, ULONG index, void *pData,
 					clipboard->req_fdata = NULL;
 				}
 			}
-			else
+			else {
+				instance->m_lSize.QuadPart =
+				    ((UINT64)instance->m_Dsc.nFileSizeHigh << 32) | instance->m_Dsc.nFileSizeLow;
 				success = TRUE;
+			}
 		}
 	}
 
@@ -1745,8 +1750,7 @@ static LRESULT CALLBACK cliprdr_proc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM 
 		DEBUG_CLIPRDR("info: WM_CLIPBOARDUPDATE");
 		// if (clipboard->sync)
 		{
-			if ((GetClipboardOwner() != clipboard->hwnd) &&
-				(S_FALSE == OleIsCurrentClipboard(clipboard->data_obj)))
+			if (!is_set_by_instance(clipboard))
 			{
 				if (clipboard->hmem)
 				{
@@ -2021,6 +2025,7 @@ static void clear_file_array(wfClipboard *clipboard)
 
 	clipboard->file_array_size = 0;
 	clipboard->nFiles = 0;
+	clipboard->first_file_index = (size_t)-1;
 }
 
 static BOOL wf_cliprdr_get_file_contents(WCHAR *file_name, BYTE *buffer, LONG positionLow,
@@ -2086,6 +2091,8 @@ static FILEDESCRIPTORW *wf_cliprdr_get_file_descriptor(WCHAR *file_name, size_t 
 		return NULL;
 	}
 
+	// to-do: use `fd->dwFlags = FD_ATTRIBUTES | FD_FILESIZE | FD_WRITESTIME | FD_PROGRESSUI`.
+	// We keep `fd->dwFlags = FD_ATTRIBUTES | FD_WRITESTIME | FD_PROGRESSUI` for compatibility.
 	// fd->dwFlags = FD_ATTRIBUTES | FD_FILESIZE | FD_WRITESTIME | FD_PROGRESSUI;
 	fd->dwFlags = FD_ATTRIBUTES | FD_WRITESTIME | FD_PROGRESSUI;
 	fd->dwFileAttributes = GetFileAttributesW(file_name);
@@ -2172,6 +2179,11 @@ static BOOL wf_cliprdr_add_to_file_arrays(wfClipboard *clipboard, WCHAR *full_fi
 	{
 		free(clipboard->file_names[clipboard->nFiles]);
 		return FALSE;
+	}
+
+	if ((clipboard->fileDescriptor[clipboard->nFiles]->dwFileAttributes &
+		 FILE_ATTRIBUTE_DIRECTORY) == 0) {
+		clipboard->first_file_index = clipboard->nFiles;
 	}
 
 	clipboard->nFiles++;
@@ -2849,6 +2861,31 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 		goto exit;
 	}
 
+	// If the clipboard is set by the instance, or the file descriptor is from remote,
+	// we should not process the request.
+	// Because this may be the following cases:
+	// 1. `A` -> `B`, `C`
+	// 2. Copy in `A`
+	// 3. Copy in `B`
+	// 4. Paste in `C`
+	// In this case, `C` should not get the file content from `A`. The clipboard is set by `B`.
+	//
+	// Or
+	// 1. `B` -> `A` -> `C`
+	// 2. Copy in `A`
+	// 2. Copy in `B`
+	// 3. Paste in `C`
+	// In this case, `C` should not get the file content from `A`. The clipboard is set by `B`.
+	//
+	// We can simply notify `C` to clear the clipboard when `A` received copy message from `B`,
+	// if connections are in the same process.
+	// But if connections are in different processes, it is not easy to notify the other process.
+	// So we just ignore the request from `C` in this case.
+	if (is_set_by_instance(clipboard) || is_file_descriptor_from_remote()) {
+		rc = ERROR_INTERNAL_ERROR;
+		goto exit;
+	}
+
 	cbRequested = fileContentsRequest->cbRequested;
 	if (fileContentsRequest->dwFlags == FILECONTENTS_SIZE)
 		cbRequested = sizeof(UINT64);
@@ -2938,6 +2975,14 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 		{
 			LARGE_INTEGER dlibMove;
 			ULARGE_INTEGER dlibNewPosition;
+
+			if (clipboard->nFiles > 0 &&
+				fileContentsRequest->listIndex == (UINT32)clipboard->first_file_index &&
+				fileContentsRequest->nPositionLow == 0 &&
+				fileContentsRequest->nPositionHigh == 0) {
+				clipboard->context->HandleClipboardFiles(fileContentsRequest->connID, clipboard->nFiles, clipboard->file_names);
+			}
+
 			dlibMove.HighPart = fileContentsRequest->nPositionHigh;
 			dlibMove.LowPart = fileContentsRequest->nPositionLow;
 			hRet = IStream_Seek(pStreamStc, dlibMove, STREAM_SEEK_SET, &dlibNewPosition);
@@ -2968,6 +3013,13 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 			{
 				rc = ERROR_INTERNAL_ERROR;
 				goto exit;
+			}
+
+			if (clipboard->nFiles > 0 &&
+				fileContentsRequest->listIndex == (UINT32)clipboard->first_file_index &&
+				fileContentsRequest->nPositionLow == 0 &&
+				fileContentsRequest->nPositionHigh == 0) {
+				clipboard->context->HandleClipboardFiles(fileContentsRequest->connID, clipboard->nFiles, clipboard->file_names);
 			}
 			bRet = wf_cliprdr_get_file_contents(
 				clipboard->file_names[fileContentsRequest->listIndex], pData,
@@ -3089,6 +3141,14 @@ wf_cliprdr_server_file_contents_response(CliprdrClientContext *context,
 	return rc;
 }
 
+BOOL is_set_by_instance(wfClipboard *clipboard)
+{
+	if (GetClipboardOwner() == clipboard->hwnd || S_OK == OleIsCurrentClipboard(clipboard->data_obj)) {
+		return TRUE;
+	}
+	return FALSE;
+}
+
 BOOL is_file_descriptor_from_remote()
 {
 	UINT fsid = 0;
@@ -3175,7 +3235,7 @@ BOOL wf_cliprdr_uninit(wfClipboard *clipboard, CliprdrClientContext *cliprdr)
 	/* discard all contexts in clipboard */
 	if (try_open_clipboard(clipboard->hwnd))
 	{
-		if (is_file_descriptor_from_remote())
+		if (is_set_by_instance(clipboard) || is_file_descriptor_from_remote())
 		{
 			if (!EmptyClipboard())
 			{
